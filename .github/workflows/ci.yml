@@ -23,6 +23,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.10", cache: pip }
       - run: pip install -r acse_service/requirements.txt
+      - run: pip install pytest
       - run: pytest acse_service/tests/ -v --tb=short
 
   test-identity:
@@ -33,6 +34,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.10", cache: pip }
       - run: pip install -r identity_service/requirements.txt
+      - run: pip install pytest
       - run: pytest identity_service/tests/ -v --tb=short
 
   test-lender:
@@ -43,6 +45,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.10", cache: pip }
       - run: pip install -r lender_service/requirements.txt
+      - run: pip install pytest
       - run: pytest lender_service/tests/ -v --tb=short
 
   test-ussd:
@@ -53,6 +56,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.10", cache: pip }
       - run: pip install -r ussd_service/requirements.txt
+      - run: pip install pytest
       - run: pytest ussd_service/tests/ -v --tb=short
 
   # ── Docker build + smoke test ─────────────────────────────────────────────────
@@ -144,5 +148,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "20", cache: npm, cache-dependency-path: pwa/package.json }
-      - run: cd pwa && npm install
+      - run: cd pwa && npm install --no-audit --no-fund
       - run: cd pwa && npm run build

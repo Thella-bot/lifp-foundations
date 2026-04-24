@@ -1,71 +1,44 @@
-"""
-lender_service/main.py
-Lender Partner Dashboard API.
-
-Endpoints:
-  GET  /v1/lender/applications        — list loan applications for this lender
-  GET  /v1/lender/credit-report/{id} — full credit report (requires consent)
-  PUT  /v1/lender/loans/{id}/status  — update a loan's status
-  GET  /v1/lender/portfolio           — portfolio summary analytics
-
-Authentication:
-  All endpoints require a valid LIFP JWT in the Authorization header.
-  The sub claim is treated as the lender_id.
-"""
 import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Optional
 
-import httpx
-from fastapi import Depends, FastAPI, HTTPException, Header, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from jose import JWTError
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.db import get_db, engine
+from shared.db import engine, get_db
 from shared.models import Base, CreditScore, LoanApplication, User
-from shared.security import verify_access_token
-
-ACSE_URL = os.environ.get("ACSE_URL", "http://acse_service:8001")
+from shared.security import require_internal_id_from_header
 
 _raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173")
 ALLOWED_ORIGINS: List[str] = [o.strip() for o in _raw_origins.split(",")]
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     yield
 
-app = FastAPI(title="LIFP — Lender Dashboard API", version="1.0.0", lifespan=lifespan)
+
+app = FastAPI(title="LIFP - Lender Dashboard API", version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "PUT"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
-# ── Auth dependency ───────────────────────────────────────────────────────────
-def get_lender_id(authorization: str = Header(...)) -> str:
-    """Extract and verify lender identity from the Bearer token."""
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="Bearer token required.")
-    token = authorization[len("Bearer "):]
-    try:
-        claims = verify_access_token(token)
-    except JWTError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail=f"Invalid token: {exc}")
-    return claims["sub"]
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
+def get_lender_id(authorization: str | None = Header(default=None)) -> str:
+    return require_internal_id_from_header(authorization)
+
+
 class ApplicationOut(BaseModel):
     id: str
     internal_id: str
@@ -75,6 +48,7 @@ class ApplicationOut(BaseModel):
     user_type: Optional[str]
     created_at: datetime
     updated_at: datetime
+
 
 class CreditReportOut(BaseModel):
     internal_id: str
@@ -86,9 +60,11 @@ class CreditReportOut(BaseModel):
     factors: list
     scored_at: Optional[datetime]
 
+
 class StatusUpdate(BaseModel):
     status: str
     note: Optional[str] = None
+
 
 class PortfolioOut(BaseModel):
     total_applications: int
@@ -101,9 +77,10 @@ class PortfolioOut(BaseModel):
     total_disbursed_amount: float
     default_rate_pct: float
 
+
 VALID_STATUSES = {"pending", "approved", "rejected", "disbursed", "repaid", "defaulted"}
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "lender"}
@@ -111,18 +88,23 @@ def health():
 
 @app.get("/v1/lender/applications", response_model=List[ApplicationOut])
 def list_applications(
-    status_filter: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
+    status_filter: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     lender_id: str = Depends(get_lender_id),
     db: Session = Depends(get_db),
 ):
-    """List loan applications submitted to this lender."""
     q = db.query(LoanApplication, User.user_type).join(
         User, LoanApplication.internal_id == User.internal_id
     ).filter(LoanApplication.lender_id == lender_id)
 
-    if status_filter and status_filter in VALID_STATUSES:
+    if status_filter:
+        status_filter = status_filter.lower()
+        if status_filter not in VALID_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status_filter. Must be one of: {sorted(VALID_STATUSES)}",
+            )
         q = q.filter(LoanApplication.status == status_filter)
 
     rows = q.order_by(LoanApplication.created_at.desc()).offset(offset).limit(limit).all()
@@ -148,14 +130,9 @@ def get_credit_report(
     lender_id: str = Depends(get_lender_id),
     db: Session = Depends(get_db),
 ):
-    """
-    Return the latest credit score for a user.
-    In production: verify consent record before returning.
-    """
     user = db.query(User).filter(User.internal_id == internal_id).first()
     if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail="User not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
     latest_score = (
         db.query(CreditScore)
@@ -183,25 +160,25 @@ def update_loan_status(
     lender_id: str = Depends(get_lender_id),
     db: Session = Depends(get_db),
 ):
-    """Update a loan's status. Repayment data feeds back to the ACSE model."""
     if update.status not in VALID_STATUSES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"Invalid status. Must be one of: {VALID_STATUSES}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status. Must be one of: {sorted(VALID_STATUSES)}",
+        )
 
     loan = db.query(LoanApplication).filter(
         LoanApplication.id == loan_id,
         LoanApplication.lender_id == lender_id,
     ).first()
     if not loan:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail="Loan not found or not owned by this lender.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Loan not found or not owned by this lender.",
+        )
 
-    loan.status     = update.status
+    loan.status = update.status
     loan.updated_at = datetime.now(timezone.utc)
     db.commit()
-
-    # TODO: publish "loan.status_updated" event to message queue so ACSE
-    #       can incorporate repayment outcomes into the next model retrain.
 
     return {"loan_id": loan_id, "new_status": update.status}
 
@@ -211,20 +188,30 @@ def portfolio_summary(
     lender_id: str = Depends(get_lender_id),
     db: Session = Depends(get_db),
 ):
-    """Aggregated portfolio analytics for this lender."""
-    apps = db.query(LoanApplication).filter(LoanApplication.lender_id == lender_id).all()
+    status_rows = (
+        db.query(LoanApplication.status, func.count(LoanApplication.id))
+        .filter(LoanApplication.lender_id == lender_id)
+        .group_by(LoanApplication.status)
+        .all()
+    )
 
     counts = {s: 0 for s in VALID_STATUSES}
-    total_disbursed = 0.0
-    for a in apps:
-        counts[a.status] = counts.get(a.status, 0) + 1
-        if a.status in ("disbursed", "repaid", "defaulted"):
-            total_disbursed += a.amount_requested
+    for status_name, count_value in status_rows:
+        counts[status_name] = int(count_value)
 
-    total = len(apps)
+    disbursed_total = (
+        db.query(func.coalesce(func.sum(LoanApplication.amount_requested), 0.0))
+        .filter(
+            LoanApplication.lender_id == lender_id,
+            LoanApplication.status.in_(["disbursed", "repaid", "defaulted"]),
+        )
+        .scalar()
+    )
+
+    total = sum(counts.values())
     defaulted = counts["defaulted"]
-    repaid    = counts["repaid"]
-    denom     = defaulted + repaid
+    repaid = counts["repaid"]
+    denom = defaulted + repaid
     default_rate = round((defaulted / denom * 100) if denom > 0 else 0.0, 2)
 
     return PortfolioOut(
@@ -235,6 +222,6 @@ def portfolio_summary(
         disbursed=counts["disbursed"],
         repaid=counts["repaid"],
         defaulted=counts["defaulted"],
-        total_disbursed_amount=round(total_disbursed, 2),
+        total_disbursed_amount=round(float(disbursed_total or 0.0), 2),
         default_rate_pct=default_rate,
     )

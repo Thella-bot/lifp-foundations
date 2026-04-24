@@ -1,8 +1,3 @@
-"""
-identity_service/main.py
-Identity bridge for mock e-KYC and consent management.
-"""
-
 import hashlib
 import os
 import sys
@@ -10,17 +5,17 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from jose import JWTError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from identity_service.auth import create_access_token, verify_token
+from identity_service.auth import create_access_token
 from shared.db import engine, get_db
 from shared.models import Base, Consent, User
+from shared.security import require_internal_id_from_header
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
@@ -36,12 +31,12 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="LIFP - Identity Bridge", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="LIFP - Identity Bridge", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -50,25 +45,8 @@ def _hash_uin(uin: str) -> str:
     return hashlib.sha256(uin.encode()).hexdigest()
 
 
-def _require_internal_id_from_token(authorization: str | None) -> str:
-    if not authorization:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Authorization header.")
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer token required.")
-
-    token = authorization.removeprefix("Bearer ").strip()
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer token required.")
-
-    try:
-        claims = verify_token(token)
-    except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
-    return claims["sub"]
-
-
 class MockLoginRequest(BaseModel):
-    uin: str
+    uin: str = Field(min_length=4, max_length=128)
     user_type: Literal["msme", "individual"] = "individual"
 
 
@@ -79,12 +57,12 @@ class TokenResponse(BaseModel):
 
 
 class ConsentRequest(BaseModel):
-    purpose: str
-    valid_days: int = 365
+    purpose: str = Field(min_length=3, max_length=100)
+    valid_days: int = Field(default=365, ge=1, le=3650)
 
 
 class ConsentRevoke(BaseModel):
-    purpose: str
+    purpose: str = Field(min_length=3, max_length=100)
 
 
 @app.get("/health")
@@ -95,16 +73,16 @@ def health():
 @app.post("/v1/auth/token", response_model=TokenResponse)
 def mock_login(request: MockLoginRequest, db: Session = Depends(get_db)):
     uin = request.uin.strip()
-    if len(uin) < 4:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="uin is too short")
-
     internal_id = _hash_uin(uin)
 
     user = db.query(User).filter(User.internal_id == internal_id).first()
     if not user:
         user = User(internal_id=internal_id, user_type=request.user_type)
         db.add(user)
-        db.commit()
+    elif user.user_type != request.user_type:
+        user.user_type = request.user_type
+
+    db.commit()
 
     token = create_access_token(internal_id)
     return TokenResponse(access_token=token, internal_id=internal_id)
@@ -116,7 +94,7 @@ def grant_consent(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    internal_id = _require_internal_id_from_token(authorization)
+    internal_id = require_internal_id_from_header(authorization)
     now = datetime.now(timezone.utc)
     valid_until = now + timedelta(days=request.valid_days)
 
@@ -150,7 +128,7 @@ def revoke_consent(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    internal_id = _require_internal_id_from_token(authorization)
+    internal_id = require_internal_id_from_header(authorization)
     now = datetime.now(timezone.utc)
 
     consent = (
@@ -169,11 +147,11 @@ def revoke_consent(
 
 @app.get("/v1/consent/status")
 def consent_status(
-    purpose: str,
+    purpose: str = Query(default="credit_scoring", min_length=3, max_length=100),
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    internal_id = _require_internal_id_from_token(authorization)
+    internal_id = require_internal_id_from_header(authorization)
     now = datetime.now(timezone.utc)
 
     consent = (
