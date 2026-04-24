@@ -1,62 +1,63 @@
+"""
+acse_service/main.py  — Alternative Credit Scoring Engine
+Fixes vs original:
+  - Redis cache stores valid JSON (not Python str())
+  - Consent token properly verified via shared JWT library (not len() check)
+  - Duplicate Feature ORM removed; imported from shared.models
+  - Batch scoring endpoint added  POST /v1/score/batch
+  - Model health endpoint         GET  /v1/model/health
+  - Deprecated @app.on_event replaced with lifespan context manager
+  - CORS locked to configurable env var (not hardcoded wildcard)
+  - No default credentials in DATABASE_URL fallback
+"""
+import json
 import os
+import sys
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
 import redis
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Float
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from shared.db import get_db
+from shared.models import Feature
+from shared.security import verify_access_token
 from model import model_manager
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://lifp:lifp_pass@localhost:5432/lifpdb"
+# ── Redis ────────────────────────────────────────────────────────────────────
+redis_client = redis.StrictRedis.from_url(
+    os.environ.get("REDIS_URL", "redis://localhost:6379"),
+    decode_responses=True,
 )
+SCORE_CACHE_TTL = int(os.environ.get("SCORE_CACHE_TTL", "3600"))
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# ── CORS ─────────────────────────────────────────────────────────────────────
+_raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173")
+ALLOWED_ORIGINS: List[str] = [o.strip() for o in _raw_origins.split(",")]
 
-Base = declarative_base()
+# ── Lifespan ─────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    model_manager.load()
+    yield
 
-class Feature(Base):
-    __tablename__ = "features"
-    user_id = Column(String, primary_key=True)
-    total_trans = Column(Float)
-    freq_per_week = Column(Float)
-    days_since_last = Column(Float)
-    active_months = Column(Float)
-    cash_in = Column(Float)
-    cash_out = Column(Float)
-    net_cash_flow = Column(Float)
-    ratio_out_in = Column(Float)
-    avg_cash_in = Column(Float)
-    avg_cash_out = Column(Float)
-    std_amount = Column(Float)
-    airtime_count = Column(Float)
-    airtime_total = Column(Float)
-    bill_count = Column(Float)
-    bill_total = Column(Float)
-    merchant_count = Column(Float)
-    merchant_total = Column(Float)
-    airtime_ratio = Column(Float)
-    merchant_ratio = Column(Float)
-    max_gap = Column(Float)
-    median_gap = Column(Float)
-    trend_slope = Column(Float)
-
-app = FastAPI(title="LIFP ACSE", version="1.0")
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="LIFP — ACSE", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-redis_client = redis.StrictRedis.from_url(
-    os.getenv("REDIS_URL", "redis://localhost:6379"), decode_responses=True
-)
-
+# ── Schemas ───────────────────────────────────────────────────────────────────
 class ScoreRequest(BaseModel):
     internal_id: str
     consent_token: str
@@ -66,44 +67,102 @@ class ScoreResponse(BaseModel):
     score: int
     tier: str
     prob_default: float
+    model_version: str
     factors: list
 
-@app.on_event("startup")
-async def startup():
-    model_manager.load()
+class BatchScoreRequest(BaseModel):
+    internal_ids: List[str]
+    consent_token: str  # service-level token issued to the lender dashboard
 
+class ModelHealthResponse(BaseModel):
+    model_version: str
+    feature_count: int
+    status: str
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _validate_consent(token: str, expected_sub: Optional[str] = None) -> dict:
+    """
+    Verify the JWT.  Raises HTTP 403 on failure.
+    Optionally asserts that token['sub'] == expected_sub.
+    """
+    try:
+        claims = verify_access_token(token)
+    except JWTError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"Invalid consent token: {exc}")
+    if expected_sub and claims.get("sub") != expected_sub:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Token subject does not match internal_id.")
+    return claims
+
+
+def _score_one(internal_id: str, db: Session) -> dict:
+    """Fetch latest features, run model, cache and return result dict."""
+    cache_key = f"score:{internal_id}"
+    cached = redis_client.get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except json.JSONDecodeError:
+            redis_client.delete(cache_key)
+
+    feature = (
+        db.query(Feature)
+        .filter(Feature.internal_id == internal_id)
+        .order_by(Feature.computed_at.desc())
+        .first()
+    )
+    if not feature:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No features found for {internal_id}. Has the data pipeline run?",
+        )
+
+    feat_dict = {
+        c.name: getattr(feature, c.name)
+        for c in Feature.__table__.columns
+        if c.name not in ("id", "internal_id", "user_type", "computed_at")
+    }
+
+    result = model_manager.predict(feat_dict, user_type=feature.user_type or "individual")
+    result["internal_id"] = internal_id
+
+    redis_client.setex(cache_key, SCORE_CACHE_TTL, json.dumps(result))
+    return result
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "acse"}
 
-@app.post("/v1/score", response_model=ScoreResponse)
-def get_credit_score(request: ScoreRequest):
-    # Very basic consent check – just verify token is not empty
-    if not request.consent_token or len(request.consent_token) < 10:
-        raise HTTPException(status_code=403, detail="Invalid consent token")
 
-    # Check cache
-    cache_key = f"score:{request.internal_id}"
-    cached = redis_client.get(cache_key)
-    if cached:
-        import json
-        return json.loads(cached)
-
-    # Fetch features from PostgreSQL
-    db = SessionLocal()
-    feature = db.query(Feature).filter(Feature.user_id == request.internal_id).first()
-    db.close()
-    if not feature:
-        raise HTTPException(status_code=404, detail="User features not found")
-
-    feat_dict = {
-        col.name: getattr(feature, col.name)
-        for col in Feature.__table__.columns if col.name != "user_id"
+@app.get("/v1/model/health", response_model=ModelHealthResponse)
+def model_health():
+    return {
+        "model_version": model_manager.version,
+        "feature_count": len(model_manager.feature_names),
+        "status": "loaded" if model_manager.model is not None else "not_loaded",
     }
 
-    result = model_manager.predict(feat_dict)
-    result["internal_id"] = request.internal_id
 
-    # Cache for 1 hour
-    redis_client.setex(cache_key, 3600, str(result))
-    return result
+@app.post("/v1/score", response_model=ScoreResponse)
+def score(request: ScoreRequest, db: Session = Depends(get_db)):
+    _validate_consent(request.consent_token, expected_sub=request.internal_id)
+    return _score_one(request.internal_id, db)
+
+
+@app.post("/v1/score/batch")
+def batch_score(request: BatchScoreRequest, db: Session = Depends(get_db)):
+    """Score up to 100 users in one call (lender dashboard use)."""
+    if len(request.internal_ids) > 100:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Batch size must not exceed 100.")
+    _validate_consent(request.consent_token)   # service-level — no sub check
+
+    results = []
+    for iid in request.internal_ids:
+        try:
+            results.append(_score_one(iid, db))
+        except HTTPException as exc:
+            results.append({"internal_id": iid, "error": exc.detail})
+    return results

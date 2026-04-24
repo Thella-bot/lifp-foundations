@@ -20,7 +20,7 @@ function Offers() {
       <h1>{userType === 'business' ? 'Business Loan Offers' : 'Personal Loan Offers'}</h1>
       {offers.map((o, i) => (
         <div key={i} style={{ border: '1px solid #ccc', padding: 10, marginBottom: 10 }}>
-          <strong>{o.lender}</strong> – {o.product}<br />
+          <strong>{o.lender}</strong> - {o.product}<br />
           Amount: {o.amount}<br />
           Interest: {o.rate}
         </div>

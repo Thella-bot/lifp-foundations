@@ -1,55 +1,177 @@
-version: '3.8'
+version: "3.9"
 
 services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
   db:
-    image: postgres:14
+    image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_USER:     ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_DB:       ${POSTGRES_DB}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     ports:
       - "5432:5432"
 
+  # ── Redis ────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     ports:
       - "6379:6379"
 
+  # ── Alembic migrations ───────────────────────────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: migrations/Dockerfile
+    restart: "no"
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST:     db
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./shared:/app/shared
+      - ./migrations:/app/migrations
+
+  # ── Data seeder (runs after migrations) ──────────────────────────────────────
   data_setup:
     build: ./data_pipeline
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_HOST=db
-    depends_on:
-      - db
     restart: "no"
-
-  acse:
-    build: ./acse_service
-    ports:
-      - "8001:8001"
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST:     db
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB}
     depends_on:
-      - redis
-      - db
-      - data_setup
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./shared:/app/shared
 
-  identity:
+  # ── Identity / e-KYC service ─────────────────────────────────────────────────
+  identity_service:
     build: ./identity_service
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:        ${POSTGRES_USER}
+      POSTGRES_PASSWORD:    ${POSTGRES_PASSWORD}
+      POSTGRES_HOST:        db
+      POSTGRES_PORT:        5432
+      POSTGRES_DB:          ${POSTGRES_DB}
+      SECRET_KEY:           ${SECRET_KEY}
+      CORS_ORIGINS:         ${CORS_ORIGINS:-http://localhost:5173}
+      TOKEN_EXPIRE_MINUTES: ${TOKEN_EXPIRE_MINUTES:-60}
+      MOSIP_ISSUER:         ${MOSIP_ISSUER:-https://mosip.lifp.co.ls}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8002:8002"
+    volumes:
+      - ./shared:/app/shared
+
+  # ── ACSE — Credit Scoring ────────────────────────────────────────────────────
+  acse_service:
+    build: ./acse_service
+    restart: unless-stopped
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=change_in_production
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST:     db
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB}
+      REDIS_URL:         redis://redis:6379
+      SECRET_KEY:        ${SECRET_KEY}
+      CORS_ORIGINS:      ${CORS_ORIGINS:-http://localhost:5173}
+      MODEL_VERSION:     ${MODEL_VERSION:-dummy-0.1.0}
+      SCORE_CACHE_TTL:   ${SCORE_CACHE_TTL:-3600}
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_healthy
+      data_setup:
+        condition: service_completed_successfully
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./shared:/app/shared
+
+  # ── Lender Dashboard API ─────────────────────────────────────────────────────
+  lender_service:
+    build: ./lender_service
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST:     db
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB}
+      SECRET_KEY:        ${SECRET_KEY}
+      CORS_ORIGINS:      ${CORS_ORIGINS:-http://localhost:5173}
+      ACSE_URL:          http://acse_service:8001
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./shared:/app/shared
+
+  # ── USSD Gateway ─────────────────────────────────────────────────────────────
+  ussd_service:
+    build: ./ussd_service
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST:     db
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB}
+      SECRET_KEY:        ${SECRET_KEY}
+      ACSE_URL:          http://acse_service:8001
+      IDENTITY_URL:      http://identity_service:8002
+      AT_API_KEY:        ${AT_API_KEY:-sandbox}
+      AT_USERNAME:       ${AT_USERNAME:-sandbox}
+    depends_on:
+      acse_service:
+        condition: service_started
+      identity_service:
+        condition: service_started
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./shared:/app/shared
+
+  # ── PWA (dev server) ─────────────────────────────────────────────────────────
+  pwa:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host"
+    volumes:
+      - ./pwa:/app
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_ACSE_URL:     http://localhost:8001
+      VITE_IDENTITY_URL: http://localhost:8002
 
 volumes:
   pgdata:

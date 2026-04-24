@@ -9,6 +9,11 @@ function RecordTransaction() {
   const userType = getUserType();
 
   const handleSave = () => {
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      alert('Please enter a valid amount greater than 0.');
+      return;
+    }
     alert(`Saved ${userType} ${type} of M${amount}`);
     navigate('/dashboard');
   };

@@ -9,6 +9,7 @@ function Login() {
   const navigate = useNavigate();
 
   const handleLogin = async () => {
+    setError('');
     try {
       await login(uin, userType);
       navigate('/dashboard');
@@ -21,7 +22,11 @@ function Login() {
     <div style={{ padding: 20, maxWidth: 400, margin: '0 auto' }}>
       <h1>LIFP</h1>
       <p>Login with your National ID</p>
-      <input value={uin} onChange={e => setUin(e.target.value)} placeholder="USER_XXXX" />
+      <input
+        value={uin}
+        onChange={e => setUin(e.target.value)}
+        placeholder="USER_XXXX"
+      />
       
       <div style={{ margin: '15px 0' }}>
         <label>

@@ -4,14 +4,25 @@ import { getScore, getUserType } from '../api';
 
 function Dashboard() {
   const [scoreData, setScoreData] = useState(null);
+  const [error, setError] = useState('');
   const navigate = useNavigate();
   const userType = getUserType();
 
   useEffect(() => {
     getScore()
       .then(setScoreData)
-      .catch(() => navigate('/'));
+      .catch((e) => setError(e.message || 'Failed to load score'));
   }, [navigate]);
+
+  if (error) {
+    return (
+      <div style={{ padding: 20, maxWidth: 500, margin: '0 auto', textAlign: 'center' }}>
+        <h1>Unable to load dashboard</h1>
+        <p>{error}</p>
+        <button onClick={() => navigate('/')}>Back to login</button>
+      </div>
+    );
+  }
 
   if (!scoreData) return <div>Loading...</div>;
 

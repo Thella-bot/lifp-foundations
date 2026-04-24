@@ -1,13 +1,45 @@
 import os
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"postgresql://{os.getenv('POSTGRES_USER', 'lifp')}:{os.getenv('POSTGRES_PASSWORD', 'lifp_pass')}@{os.getenv('POSTGRES_HOST', 'localhost')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB', 'lifpdb')}"
+
+def _build_url() -> str:
+    url = os.getenv("DATABASE_URL")
+    if url:
+        return url
+    user = os.getenv("POSTGRES_USER")
+    pw   = os.getenv("POSTGRES_PASSWORD")
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    db   = os.getenv("POSTGRES_DB")
+    if not all([user, pw, db]):
+        raise RuntimeError(
+            "Database connection not configured. "
+            "Set DATABASE_URL or POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB."
+        )
+    return f"postgresql://{user}:{pw}@{host}:{port}/{db}"
+
+
+DATABASE_URL = _build_url()
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
 )
 
-engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def get_db():
+    """FastAPI dependency — yields a session and always closes it."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
